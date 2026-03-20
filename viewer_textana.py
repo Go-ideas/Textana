@@ -38,6 +38,8 @@ def main() -> None:
 
     if "viewer_result_excel_path" not in st.session_state:
         st.session_state["viewer_result_excel_path"] = ""
+    if "viewer_has_valid_payload" not in st.session_state:
+        st.session_state["viewer_has_valid_payload"] = False
     if "viewer_pkg_bytes" not in st.session_state:
         st.session_state["viewer_pkg_bytes"] = b""
     if "viewer_pkg_name" not in st.session_state:
@@ -53,14 +55,24 @@ def main() -> None:
                 st.session_state["viewer_result_excel_path"] = str(path)
                 st.session_state["viewer_pkg_bytes"] = uploaded.getvalue()
                 st.session_state["viewer_pkg_name"] = uploaded.name or "paquete.textana"
+                st.session_state["viewer_has_valid_payload"] = True
                 st.success(f"{msg} Archivo: {Path(src_name or 'resultado.xlsx').name}")
             except Exception as exc:
+                st.session_state["viewer_has_valid_payload"] = False
                 st.error(f"No se pudo preparar el archivo para visualizacion: {exc}")
         else:
+            st.session_state["viewer_has_valid_payload"] = False
             st.error(msg)
 
-    excel_path = Path(st.session_state.get("viewer_result_excel_path", ""))
-    if excel_path and excel_path.exists():
+    excel_raw = str(st.session_state.get("viewer_result_excel_path", "")).strip()
+    excel_path = Path(excel_raw) if excel_raw else None
+    can_render = bool(
+        st.session_state.get("viewer_has_valid_payload", False)
+        and excel_path is not None
+        and excel_path.exists()
+        and excel_path.is_file()
+    )
+    if can_render and excel_path is not None:
         ok_full, issues = check_viewer_excel_completeness(excel_path)
         if not ok_full:
             st.warning("El paquete cargado no trae toda la estructura para mostrar todos los graficos:")
