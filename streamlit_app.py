@@ -205,6 +205,14 @@ def get_textana_signing_key() -> bytes:
     # Clave local para firmar/validar paquetes .textana.
     env_key = os.getenv("TEXTANA_SIGN_KEY", "").strip()
     if env_key:
+        # Acepta secreto en texto plano o en Base64 URL-safe (recomendado para Streamlit Secrets).
+        try:
+            padded = env_key + ("=" * ((4 - len(env_key) % 4) % 4))
+            decoded = base64.urlsafe_b64decode(padded.encode("utf-8"))
+            if len(decoded) >= 16:
+                return decoded
+        except Exception:
+            pass
         return env_key.encode("utf-8")
     key_path = ROOT / ".textana_signing_key"
     if key_path.exists():
