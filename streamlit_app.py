@@ -13,6 +13,7 @@ import sys
 import time
 import unicodedata
 import zipfile
+from datetime import datetime
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -461,6 +462,53 @@ def collect_viewer_extra_files() -> dict[str, bytes]:
     return extras
 
 
+def collect_original_graph_assets() -> dict[str, bytes]:
+    """Recolecta todos los graficos originales disponibles para exportacion."""
+    assets: dict[str, bytes] = {}
+
+    def _normalize_rel_name(rel_name: str) -> str:
+        rel = str(rel_name).replace("\\", "/")
+        # Evita duplicar la red con dos nombres distintos.
+        if rel.lower().endswith("graficos/red_interactiva.html"):
+            return "graficos/07_red_interactiva.html"
+        return rel
+
+    # 1) Todo lo que exista dentro de output/graficos (incluye subcarpetas).
+    graficos_dir = OUTPUT_DIR / "graficos"
+    if graficos_dir.exists():
+        for fp in graficos_dir.rglob("*"):
+            if not fp.is_file():
+                continue
+            if fp.suffix.lower() not in {".png", ".html", ".svg", ".jpg", ".jpeg", ".webp", ".json"}:
+                continue
+            try:
+                rel_name = _normalize_rel_name(fp.relative_to(OUTPUT_DIR).as_posix())
+                assets[f"original/{rel_name}"] = fp.read_bytes()
+            except Exception:
+                continue
+
+    # 2) Graficos historicos que a veces viven en la raiz de output.
+    legacy_files = [
+        "barras_topicos.png",
+        "pareto_topicos.png",
+        "treemap_topicos.png",
+        "nube_palabras.png",
+        "heatmap_topicos.png",
+        "sankey_topicos.html",
+        "sankey_topicos.png",
+        "red_interactiva.html",
+    ]
+    for name in legacy_files:
+        fp = OUTPUT_DIR / name
+        if fp.exists() and fp.is_file():
+            try:
+                assets[f"original/{name}"] = fp.read_bytes()
+            except Exception:
+                continue
+
+    return assets
+
+
 def restore_viewer_extra_files(extra_files: dict[str, bytes]) -> None:
     for rel_path, content in extra_files.items():
         rel_norm = str(rel_path).replace("\\", "/").lstrip("/")
@@ -594,6 +642,20 @@ def render_visual_dashboard(
         st.error(f"No se pudieron cargar los resultados para visualizacion: {exc}")
         return
 
+    # Reinicia controles visuales al cambiar de archivo para evitar "arrastre"
+    # de estados previos que hace ver graficos distintos y marca falsos "editados".
+    controls_ver_key = f"{key_prefix}_controls_filever"
+    if st.session_state.get(controls_ver_key) != file_version:
+        drop_keys = [
+            k for k in st.session_state.keys()
+            if str(k).startswith(f"{key_prefix}_")
+            and not str(k).startswith(f"{key_prefix}_original_snapshot_")
+            and k != controls_ver_key
+        ]
+        for k in drop_keys:
+            st.session_state.pop(k, None)
+        st.session_state[controls_ver_key] = file_version
+
     if "Frecuencia" not in df_ldc.columns:
         st.warning("La hoja LDC no contiene la columna esperada: Frecuencia.")
         return
@@ -618,14 +680,72 @@ def render_visual_dashboard(
 
     st.subheader("Visualizador interactivo")
     export_assets: dict[str, bytes] = {}
+    # Snapshot "original": captura lo visible al abrir (primer render por archivo).
+    snapshot_ver_key = f"{key_prefix}_original_snapshot_filever"
+    snapshot_assets_key = f"{key_prefix}_original_snapshot_assets"
+    if st.session_state.get(snapshot_ver_key) != file_version:
+        st.session_state[snapshot_ver_key] = file_version
+        st.session_state[snapshot_assets_key] = {}
+    snapshot_assets: dict[str, bytes] = dict(st.session_state.get(snapshot_assets_key, {}))
+
+    def remember_original(asset_name: str, asset_bytes: bytes | None) -> None:
+        if not asset_bytes:
+            return
+        original_name = f"original/graficos/{asset_name}"
+        if original_name not in snapshot_assets:
+            snapshot_assets[original_name] = asset_bytes
+
+    def harmonize_plotly_layout(fig, stem: str) -> None:
+        # Mantiene margenes/etiquetas consistentes entre Streamlit y HTML exportado.
+        if stem == "01_barras":
+            fig.update_layout(margin=dict(l=260, r=40, t=60, b=60))
+            fig.update_xaxes(automargin=True)
+            fig.update_yaxes(automargin=True)
+        elif stem == "02_pareto":
+            fig.update_layout(margin=dict(l=80, r=90, t=60, b=210))
+            fig.update_xaxes(automargin=True)
+            fig.update_yaxes(automargin=True)
+            if "yaxis2" in fig.layout:
+                fig.layout.yaxis2.automargin = True
+        elif stem.startswith("05_heatmap"):
+            fig.update_layout(margin=dict(l=230, r=40, t=60, b=90))
+            fig.update_xaxes(automargin=True)
+            fig.update_yaxes(automargin=True)
+
+    def add_plotly_exports(fig, edited_stem: str, edited: bool = True) -> None:
+        export_fig = go.Figure(fig)
+        harmonize_plotly_layout(export_fig, edited_stem)
+        if export_fig.layout.height is None:
+            export_fig.update_layout(height=620)
+        export_fig.update_layout(autosize=False, width=1280)
+        # Siempre exporta HTML para no depender de Kaleido.
+        try:
+            html_bytes = export_fig.to_html(
+                include_plotlyjs="cdn",
+                full_html=True,
+                config={"responsive": False},
+            ).encode("utf-8")
+            if edited:
+                export_assets[f"editado/graficos/{edited_stem}.html"] = html_bytes
+            remember_original(f"{edited_stem}.html", html_bytes)
+        except Exception:
+            pass
+        # Si Kaleido esta disponible, tambien agrega PNG.
+        png_bytes = fig_to_png_bytes(export_fig)
+        if png_bytes:
+            if edited:
+                export_assets[f"editado/graficos/{edited_stem}.png"] = png_bytes
+            remember_original(f"{edited_stem}.png", png_bytes)
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        top_n = st.slider(f"Top N {item_label.lower()}s", min_value=3, max_value=min(50, max(3, len(df_ldc))), value=min(15, max(3, len(df_ldc))))
+        default_top_n = min(15, max(3, len(df_ldc)))
+        top_n = st.slider(f"Top N {item_label.lower()}s", min_value=3, max_value=min(50, max(3, len(df_ldc))), value=default_top_n)
     with c2:
         min_freq = st.number_input("Frecuencia minima", min_value=1, value=1)
     with c3:
         palette = st.selectbox("Paleta", options=["Blues", "Viridis", "Cividis", "Plasma", "Magma", "Turbo"], index=0)
+    global_has_edits = (top_n != default_top_n) or (int(min_freq) != 1) or (palette != "Blues")
 
     has_network = (OUTPUT_DIR / "graficos" / "red_interactiva.html").exists()
     graph_options = ["Barras", "Pareto", "Treemap", "Nube de palabras", "Heatmap", "Sankey"]
@@ -692,10 +812,10 @@ def render_visual_dashboard(
                 texttemplate="%{customdata[0]:.0f}%",
                 cliponaxis=False,
             )
+        harmonize_plotly_layout(fig_bar, "01_barras")
         st.plotly_chart(fig_bar, use_container_width=True)
-        bar_png = fig_to_png_bytes(fig_bar)
-        if bar_png:
-            export_assets["editado/01_barras.png"] = bar_png
+        bar_edited = global_has_edits or (orient != "Horizontal") or (bar_height != 520) or (show_values is not True)
+        add_plotly_exports(fig_bar, "01_barras", edited=bar_edited)
 
     if "Pareto" in viz_types and not df_plot.empty:
         try:
@@ -717,6 +837,8 @@ def render_visual_dashboard(
                 y="Porcentaje",
                 title=f"Pareto de {item_label.lower()}s",
             )
+            # Colores fijos para que portal y exportacion salgan consistentes.
+            fig_pareto.update_traces(marker_color="#1f77b4", selector=dict(type="bar"))
             fig_pareto.update_xaxes(tickangle=45)
             fig_pareto.update_traces(
                 texttemplate="%{y:.0f}%",
@@ -729,6 +851,8 @@ def render_visual_dashboard(
                 mode="lines+markers" if show_markers else "lines",
                 yaxis="y2",
                 name="% acumulado",
+                line=dict(color="#6baed6", width=2),
+                marker=dict(color="#6baed6", size=6),
                 hovertemplate="%{x}<br>% acumulado: %{y:.0f}%<extra></extra>",
             )
             fig_pareto.add_hline(y=pareto_target, line_dash="dash", line_color="gray", yref="y2")
@@ -762,10 +886,10 @@ def render_visual_dashboard(
                     tickformat=".0f",
                 )
             )
+            harmonize_plotly_layout(fig_pareto, "02_pareto")
             st.plotly_chart(fig_pareto, use_container_width=True)
-            pareto_png = fig_to_png_bytes(fig_pareto)
-            if pareto_png:
-                export_assets["editado/02_pareto.png"] = pareto_png
+            pareto_edited = global_has_edits or (pareto_height != 520) or (pareto_target != 80) or (show_markers is not True)
+            add_plotly_exports(fig_pareto, "02_pareto", edited=pareto_edited)
         except Exception as exc:
             st.error(f"No se pudo renderizar Pareto: {exc}")
 
@@ -900,9 +1024,21 @@ def render_visual_dashboard(
             ),
         )
         st.plotly_chart(fig_tree, use_container_width=True)
-        tree_png = fig_to_png_bytes(fig_tree)
-        if tree_png:
-            export_assets["editado/03_treemap.png"] = tree_png
+        treemap_edited = global_has_edits or any(
+            [
+                tree_text_mode != "Etiqueta",
+                tree_font_size != 14,
+                tree_max_depth != 2,
+                tree_height != 620,
+                tree_pad != 1,
+                tree_sort is not True,
+                tree_chars_line != 18,
+                tree_max_lines != 2,
+                tree_auto_font is not True,
+                tree_palette_name != "Pastel elegante",
+            ]
+        )
+        add_plotly_exports(fig_tree, "03_treemap", edited=treemap_edited)
 
     if "Nube de palabras" in viz_types and not df_plot.empty:
         with st.expander("Editar: Nube de palabras", expanded=False):
@@ -947,7 +1083,37 @@ def render_visual_dashboard(
                 st.image(wc_array, caption=f"Nube de palabras - {selected_topic}", use_column_width=True)
                 img_buf = BytesIO()
                 Image.fromarray(wc_array).save(img_buf, format="PNG")
-                export_assets["editado/04_nube_palabras.png"] = img_buf.getvalue()
+                # Cambiar solo el topico visible no cuenta como "edicion" del entregable.
+                wc_edited = global_has_edits or any(
+                    [
+                        max_words != 120,
+                        bg != "white",
+                        wc_height != 420,
+                    ]
+                )
+                if wc_edited:
+                    export_assets["editado/graficos/04_nube_palabras.png"] = img_buf.getvalue()
+                remember_original("04_nube_palabras.png", img_buf.getvalue())
+
+                # Exporta todas las nubes (no solo la visible) en originales.
+                for topic_name in topic_options:
+                    mask_all = False
+                    for col in topic_cols:
+                        mask_all = mask_all | (df_corr[col].apply(clean_text_value) == topic_name)
+                    textos_all = df_corr.loc[mask_all, text_col].dropna().astype(str).tolist()
+                    if not textos_all:
+                        continue
+                    wc_all = WordCloud(
+                        width=1200,
+                        height=wc_height,
+                        background_color=bg,
+                        max_words=max_words,
+                        stopwords=stop,
+                    ).generate(" ".join(textos_all))
+                    buf_all = BytesIO()
+                    Image.fromarray(wc_all.to_array()).save(buf_all, format="PNG")
+                    topic_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(topic_name)).strip("._") or "item"
+                    remember_original(f"nubes/04_nube_{topic_slug}.png", buf_all.getvalue())
 
     if "Heatmap" in viz_types:
         with st.expander("Editar: Heatmap", expanded=False):
@@ -997,10 +1163,17 @@ def render_visual_dashboard(
                         aspect="auto",
                     )
                     fig_hm.update_layout(height=hm_height)
+                    harmonize_plotly_layout(fig_hm, "05_heatmap_posicion")
+                    harmonize_plotly_layout(fig_hm, "05_heatmap_coocurrencia")
                     st.plotly_chart(fig_hm, use_container_width=True)
-                    hm_png = fig_to_png_bytes(fig_hm)
-                    if hm_png:
-                        export_assets["editado/05_heatmap_posicion.png"] = hm_png
+                    heatmap_edited = global_has_edits or any(
+                        [
+                            hm_mode != "Contexto x Posicion",
+                            hm_height != 560,
+                            hm_color != "Blues",
+                        ]
+                    )
+                    add_plotly_exports(fig_hm, "05_heatmap_posicion", edited=heatmap_edited)
             else:
                 pairs = {}
                 for _, row in df_corr.iterrows():
@@ -1034,9 +1207,14 @@ def render_visual_dashboard(
                     )
                     fig_hm.update_layout(height=hm_height)
                     st.plotly_chart(fig_hm, use_container_width=True)
-                    hm_png = fig_to_png_bytes(fig_hm)
-                    if hm_png:
-                        export_assets["editado/05_heatmap_coocurrencia.png"] = hm_png
+                    heatmap_edited = global_has_edits or any(
+                        [
+                            hm_mode != "Contexto x Posicion",
+                            hm_height != 560,
+                            hm_color != "Blues",
+                        ]
+                    )
+                    add_plotly_exports(fig_hm, "05_heatmap_coocurrencia", edited=heatmap_edited)
 
     if "Sankey" in viz_types:
         with st.expander("Editar: Sankey", expanded=False):
@@ -1301,9 +1479,30 @@ def render_visual_dashboard(
                 st.caption(f"Flujo principal: {strongest_txt} (n={strongest['value']})")
 
                 st.plotly_chart(fig_sankey, use_container_width=True)
-                sankey_png = fig_to_png_bytes(fig_sankey)
-                if sankey_png:
-                    export_assets["editado/06_sankey.png"] = sankey_png
+                sankey_edited = global_has_edits or any(
+                    [
+                        sankey_mode != "Cadena adyacente completa",
+                        sankey_min != 2,
+                        sankey_pad != 14,
+                        sankey_height != 620,
+                        sankey_max_links != 80,
+                        sankey_label_len != 28,
+                        sankey_thickness != 16,
+                        abs(float(sankey_link_alpha) - 0.35) > 1e-9,
+                        sankey_font_size != 15,
+                        sankey_text_color != "Negro",
+                        sankey_font_family != "Verdana",
+                        sankey_compact_labels is not True,
+                        sankey_hide_self is not True,
+                        show_only_top_flows is not True,
+                        top_n_flows != 120,
+                        abs(float(min_link_pct) - 0.8) > 1e-9,
+                        group_similar_labels is not True,
+                        abs(float(similarity_threshold) - 0.86) > 1e-9,
+                        sankey_arrangement != "snap",
+                    ]
+                )
+                add_plotly_exports(fig_sankey, "06_sankey", edited=sankey_edited)
 
     html_red = OUTPUT_DIR / "graficos" / "red_interactiva.html"
     if "Red interactiva" in viz_types and html_red.exists():
@@ -1312,14 +1511,19 @@ def render_visual_dashboard(
         with st.expander("Ver red interactiva generada (Paso 5)", expanded=True):
             html_content = html_red.read_text(encoding="utf-8", errors="replace")
             components.html(html_content, height=net_height, scrolling=True)
-            export_assets["editado/07_red_interactiva.html"] = html_content.encode("utf-8")
+            if global_has_edits or (net_height != 900):
+                export_assets["editado/graficos/07_red_interactiva.html"] = html_content.encode("utf-8")
+            remember_original("07_red_interactiva.html", html_content.encode("utf-8"))
 
     # Incluye siempre los graficos originales del pipeline (si existen).
-    original_dir = OUTPUT_DIR / "graficos"
-    if original_dir.exists():
-        for p in original_dir.glob("*"):
-            if p.is_file() and p.suffix.lower() in {".png", ".html"}:
-                export_assets[f"original/{p.name}"] = p.read_bytes()
+    original_assets = {
+        k: v for k, v in collect_original_graph_assets().items()
+        if str(k).startswith("original/graficos/")
+    }
+    # El snapshot de apertura tiene prioridad para "original al abrir".
+    original_assets.update(snapshot_assets)
+    export_assets.update(original_assets)
+    st.session_state[snapshot_assets_key] = snapshot_assets
 
     if export_assets:
         st.markdown("**Exportacion**")
@@ -1621,6 +1825,9 @@ def run_pipeline(
     threads_validacion: int,
     max_topicos: int,
     max_contextos: int,
+    max_pct_otros: float,
+    demo_mode: bool,
+    demo_pct: float,
     export_spss: bool,
     progress_bar,
     status_box,
@@ -1650,9 +1857,14 @@ def run_pipeline(
         str(max_topicos),
         "--max-contextos",
         str(max_contextos),
+        "--max-pct-otros",
+        str(max_pct_otros),
         "--output-dir",
         str(OUTPUT_DIR),
     ]
+
+    if demo_mode:
+        cmd.extend(["--demo", "--demo-pct", str(demo_pct)])
 
     if not export_spss:
         cmd.append("--skip-spss")
@@ -1826,8 +2038,19 @@ def main() -> None:
     with c3:
         max_topicos = st.number_input("Max topicos", min_value=1, max_value=20, value=5)
         max_contextos = st.number_input("Max contextos", min_value=1, max_value=20, value=3)
+        max_pct_otros = st.number_input("% max 9999 (Otros)", min_value=0.0, max_value=100.0, value=5.0, step=1.0)
         token_file = st.text_input("Archivo token", value="tokenkey.txt")
     with c4:
+        demo_mode = st.checkbox("Demo", value=False)
+        demo_pct = st.number_input(
+            "Demostracion",
+            min_value=0.1,
+            max_value=100.0,
+            value=20.0,
+            step=1.0,
+            disabled=not demo_mode,
+            help="% de casos de la base que se ejecutaran cuando Demo este activo.",
+        )
         log_height = st.slider("Alto log (px)", min_value=180, max_value=700, value=320, step=20)
 
     cross_vars_param: list[str] = []
@@ -1879,6 +2102,9 @@ def main() -> None:
             threads_validacion=int(threads_validacion),
             max_topicos=int(max_topicos),
             max_contextos=int(max_contextos),
+            max_pct_otros=float(max_pct_otros),
+            demo_mode=bool(demo_mode),
+            demo_pct=float(demo_pct),
             export_spss=export_spss,
             progress_bar=progress_bar,
             status_box=status_box,
@@ -1974,10 +2200,21 @@ def main() -> None:
     with down_col:
         if graphs_enabled:
             excel_complete, excel_issues = check_viewer_excel_completeness(result_excel)
+            fecha_tag = datetime.now().strftime("%Y%m%d")
+            hoja_tag_raw = clean_text_value(sheet) or "Hoja"
+            col_tag_raw = clean_text_value(cols_sel[0] if cols_sel else "") or "Columna"
+
+            def _safe_name(value: str) -> str:
+                txt = unicodedata.normalize("NFKD", str(value))
+                txt = txt.encode("ascii", "ignore").decode("ascii")
+                txt = re.sub(r"[^A-Za-z0-9._-]+", "_", txt).strip("._")
+                return txt or "NA"
+
+            export_name = f"{fecha_tag}_{_safe_name(hoja_tag_raw)}_{_safe_name(col_tag_raw)}_Report.xlsx"
             st.download_button(
-                "Exportar archivo de graficos (.xlsx)",
+                "Exportar Reporte (.xlsx)",
                 data=result_excel.read_bytes(),
-                file_name=result_excel.name,
+                file_name=export_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -2001,7 +2238,7 @@ def main() -> None:
             else:
                 st.button("Exportar paquete seguro (.textana)", disabled=True, use_container_width=True)
         else:
-            st.button("Exportar archivo de graficos (.xlsx)", disabled=True, use_container_width=True)
+            st.button("Exportar Reporte (.xlsx)", disabled=True, use_container_width=True)
             st.button("Exportar paquete seguro (.textana)", disabled=True, use_container_width=True)
 
     if graphs_enabled:

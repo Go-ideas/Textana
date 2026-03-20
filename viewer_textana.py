@@ -364,13 +364,24 @@ def main() -> None:
             st.warning("El paquete cargado no trae toda la estructura para mostrar todos los graficos:")
             for it in issues:
                 st.caption(f"- {it}")
-        st.download_button(
-            "Descargar paquete .textana cargado",
-            data=st.session_state["viewer_pkg_bytes"],
-            file_name=st.session_state["viewer_pkg_name"],
-            mime="application/octet-stream",
-            disabled=(len(st.session_state["viewer_pkg_bytes"]) == 0),
-        )
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Descargar paquete .textana cargado",
+                data=st.session_state["viewer_pkg_bytes"],
+                file_name=st.session_state["viewer_pkg_name"],
+                mime="application/octet-stream",
+                disabled=(len(st.session_state["viewer_pkg_bytes"]) == 0),
+                use_container_width=True,
+            )
+        with d2:
+            st.download_button(
+                "Descargar Excel final (editado)",
+                data=excel_path.read_bytes(),
+                file_name=f"{excel_path.stem}_final.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
         if render_editor(excel_path):
             st.rerun()
 
