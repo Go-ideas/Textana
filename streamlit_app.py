@@ -108,6 +108,32 @@ def smart_truncate_label(text: str, max_len: int) -> str:
     return head.rstrip(" ,.;:-") + "..."
 
 
+def is_otros_label(text: str) -> bool:
+    s = clean_text_value(text).lower()
+    s = "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s == "otros" or s.startswith("otros ")
+
+
+def sort_items_otros_last(
+    df: pd.DataFrame,
+    label_col: str = "Item",
+    freq_col: str = "Frecuencia",
+    ascending_freq: bool = False,
+) -> pd.DataFrame:
+    if df.empty or label_col not in df.columns:
+        return df
+    out = df.copy()
+    out["__is_otros"] = out[label_col].apply(is_otros_label)
+    out = out.sort_values(
+        by=["__is_otros", freq_col, label_col],
+        ascending=[True, ascending_freq, True],
+        kind="stable",
+    )
+    return out.drop(columns=["__is_otros"])
+
+
 def normalize_label_text(text: str) -> str:
     s = clean_text_value(text)
     return re.sub(r"\s+", " ", s).strip()
@@ -585,6 +611,10 @@ def render_visual_dashboard(
 
     df_ldc["Item"] = df_ldc[item_col].apply(clean_text_value)
     df_ldc = df_ldc[df_ldc["Item"] != ""]
+    if "COD_Topico" in df_ldc.columns:
+        mask_otros = df_ldc["Item"].apply(is_otros_label)
+        if mask_otros.any():
+            df_ldc.loc[mask_otros, "COD_Topico"] = 9999
 
     st.subheader("Visualizador interactivo")
     export_assets: dict[str, bytes] = {}
@@ -610,9 +640,8 @@ def render_visual_dashboard(
     df_plot = (
         df_plot.groupby("Item", as_index=False)["Frecuencia"]
         .sum()
-        .sort_values("Frecuencia", ascending=False)
-        .head(top_n)
     )
+    df_plot = sort_items_otros_last(df_plot, label_col="Item", freq_col="Frecuencia", ascending_freq=False).head(top_n)
     total_plot = df_plot["Frecuencia"].sum()
     if total_plot > 0:
         df_plot["Porcentaje"] = df_plot["Frecuencia"] / total_plot * 100
@@ -633,8 +662,9 @@ def render_visual_dashboard(
                 show_values = st.checkbox("Mostrar valores", value=True, key=f"{key_prefix}_bar_values")
 
         if orient == "Horizontal":
+            bar_df_h = sort_items_otros_last(df_plot, label_col="Item", freq_col="Frecuencia", ascending_freq=True)
             fig_bar = px.bar(
-                df_plot.sort_values("Frecuencia", ascending=True),
+                bar_df_h,
                 x="Frecuencia",
                 y="Item",
                 color="Frecuencia",
@@ -653,7 +683,7 @@ def render_visual_dashboard(
             fig_bar.update_xaxes(tickangle=45)
         fig_bar.update_layout(height=bar_height)
         fig_bar.update_traces(
-            customdata=df_plot[["Porcentaje"]].values if orient == "Vertical" else df_plot.sort_values("Frecuencia", ascending=True)[["Porcentaje"]].values,
+            customdata=df_plot[["Porcentaje"]].values if orient == "Vertical" else bar_df_h[["Porcentaje"]].values,
             hovertemplate="%{y}<br>Frecuencia: %{x}<br>Porcentaje: %{customdata[0]:.0f}%<extra></extra>" if orient == "Horizontal" else "%{x}<br>Frecuencia: %{y}<br>Porcentaje: %{customdata[0]:.0f}%<extra></extra>",
         )
         if show_values:
@@ -678,7 +708,7 @@ def render_visual_dashboard(
                 with pc3:
                     show_markers = st.checkbox("Marcadores linea", value=True, key=f"{key_prefix}_par_markers")
 
-            pareto_df = df_plot.sort_values("Frecuencia", ascending=False).copy()
+            pareto_df = sort_items_otros_last(df_plot, label_col="Item", freq_col="Frecuencia", ascending_freq=False).copy()
             pareto_df["Porcentaje"] = pareto_df["Frecuencia"] / pareto_df["Frecuencia"].sum() * 100
             pareto_df["AcumuladoPct"] = pareto_df["Porcentaje"].cumsum()
             fig_pareto = px.bar(
@@ -797,7 +827,7 @@ def render_visual_dashboard(
 
         tree_df = df_plot.copy()
         if tree_sort:
-            tree_df = tree_df.sort_values("Frecuencia", ascending=False)
+            tree_df = sort_items_otros_last(tree_df, label_col="Item", freq_col="Frecuencia", ascending_freq=False)
         tree_df["Topico_Display"] = tree_df["Item"].astype(str).apply(
             lambda x: format_treemap_label(x, tree_chars_line, tree_max_lines)
         )
@@ -951,6 +981,10 @@ def render_visual_dashboard(
                 mat = pd.crosstab(melted["Contexto"], melted["Posicion"])
                 mat = mat.reindex(columns=topic_cols, fill_value=0)
                 mat = mat.reindex(mat.sum(axis=1).sort_values(ascending=False).index).head(top_n)
+                if not mat.empty:
+                    idx_no_otros = [i for i in mat.index if not is_otros_label(i)]
+                    idx_otros = [i for i in mat.index if is_otros_label(i)]
+                    mat = mat.reindex(idx_no_otros + idx_otros)
 
                 if mat.empty:
                     st.info("No hay datos suficientes para el heatmap de posicion.")
