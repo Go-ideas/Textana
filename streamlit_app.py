@@ -57,6 +57,20 @@ def clean_text_value(v) -> str:
     return s
 
 
+def fix_mojibake_text(s: str) -> str:
+    txt = "" if s is None else str(s)
+    if not any(tok in txt for tok in ("Ã", "Â", "â€")):
+        return txt
+    try:
+        fixed = txt.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+        # Usa la version reparada solo si mejora claramente.
+        if fixed and fixed.count("Ã") + fixed.count("Â") < txt.count("Ã") + txt.count("Â"):
+            return fixed
+    except Exception:
+        pass
+    return txt
+
+
 def format_treemap_label(text: str, max_chars_line: int, max_lines: int) -> str:
     words = clean_text_value(text).split()
     if not words:
@@ -1510,6 +1524,7 @@ def render_visual_dashboard(
             net_height = st.slider("Alto red (px)", min_value=500, max_value=1400, value=900, step=20, key=f"{key_prefix}_net_height")
         with st.expander("Ver red interactiva generada (Paso 5)", expanded=True):
             html_content = html_red.read_text(encoding="utf-8", errors="replace")
+            html_content = fix_mojibake_text(html_content)
             components.html(html_content, height=net_height, scrolling=True)
             if global_has_edits or (net_height != 900):
                 export_assets["editado/graficos/07_red_interactiva.html"] = html_content.encode("utf-8")
