@@ -419,7 +419,12 @@ def build_network_html_from_df(
     except Exception:
         partition = {n: 0 for n in Gf.nodes()}
 
-    pos = nx.kamada_kawai_layout(Gf)
+    # kamada_kawai_layout depende de scipy; en entornos cloud puede no estar disponible.
+    try:
+        pos = nx.kamada_kawai_layout(Gf)
+    except Exception:
+        # Fallback estable sin scipy para evitar caida del visualizador.
+        pos = nx.spring_layout(Gf, seed=42)
 
     net = Network(
         height=f"{int(height_px)}px",
