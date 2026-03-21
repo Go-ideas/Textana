@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
-import time
 from pathlib import Path
 
 import pandas as pd
@@ -15,11 +15,15 @@ from streamlit_app import (
     apply_layout_tweaks,
     build_secure_textana_package,
     check_viewer_excel_completeness,
+    cleanup_temp_outputs_once,
     clean_text_value,
     collect_viewer_extra_files,
     is_otros_label,
     render_visual_dashboard,
     restore_viewer_extra_files,
+    save_uploaded_result_excel,
+    set_active_assets_for_file,
+    _short_hash,
     secure_package_available,
     sort_items_otros_last,
     validate_secure_textana_package,
@@ -27,11 +31,8 @@ from streamlit_app import (
 
 
 def save_secure_payload(payload_bytes: bytes, source_name: str) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(source_name or "resultado").stem).strip("._") or "resultado"
-    target = OUTPUT_DIR / f"{stem}_viewer_{time.time_ns()}.xlsx"
-    target.write_bytes(payload_bytes)
-    return target
+    return save_uploaded_result_excel(payload_bytes, stem=f"{stem}_viewer", source_name=source_name)
 
 
 def load_excel_sheets(path: Path) -> dict[str, pd.DataFrame]:
@@ -316,6 +317,7 @@ def render_editor(excel_path: Path) -> bool:
 def main() -> None:
     st.set_page_config(page_title="Textana Viewer", layout="wide")
     apply_layout_tweaks()
+    cleanup_temp_outputs_once(max_age_hours=24)
     logo_path = Path(__file__).resolve().parent / "Propuesta 4 32.png"
     if logo_path.exists():
         st.image(str(logo_path), width=220)
@@ -333,25 +335,44 @@ def main() -> None:
 
     uploaded = st.file_uploader("Cargar paquete seguro (.textana)", type=["textana"], key="viewer_pkg_upload")
     if uploaded is not None:
-        ok, msg, payload_bytes, src_name, extra_files = validate_secure_textana_package(uploaded.getvalue())
+        raw = uploaded.getvalue()
+        up_sig = _short_hash(f"{uploaded.name}|{hashlib.sha1(raw).hexdigest()}", size=24)
+        if st.session_state.get("viewer_last_upload_sig") == up_sig:
+            ok, msg, payload_bytes, src_name, extra_files = False, "", None, None, {}
+            st.caption(f"Paquete ya cargado en esta sesion: {uploaded.name}")
+        else:
+            ok, msg, payload_bytes, src_name, extra_files = validate_secure_textana_package(raw)
         if ok and payload_bytes is not None:
             try:
                 path = save_secure_payload(payload_bytes, src_name or "resultado.xlsx")
-                restore_viewer_extra_files(extra_files)
+                assets_dir = set_active_assets_for_file(path)
+                restore_viewer_extra_files(extra_files, assets_dir=assets_dir)
                 st.session_state["viewer_result_excel_path"] = str(path)
                 st.session_state["viewer_pkg_bytes"] = uploaded.getvalue()
                 st.session_state["viewer_pkg_name"] = uploaded.name or "paquete.textana"
                 st.session_state["viewer_has_valid_payload"] = True
+                st.session_state["viewer_last_upload_sig"] = up_sig
                 st.success(f"{msg} Archivo: {Path(src_name or 'resultado.xlsx').name}")
             except Exception as exc:
                 st.session_state["viewer_has_valid_payload"] = False
                 st.error(f"No se pudo preparar el archivo para visualizacion: {exc}")
-        else:
+        elif msg:
             st.session_state["viewer_has_valid_payload"] = False
             st.error(msg)
 
     excel_raw = str(st.session_state.get("viewer_result_excel_path", "")).strip()
     excel_path = Path(excel_raw) if excel_raw else None
+    excel_token = ""
+    if excel_path is not None and excel_path.exists():
+        try:
+            stt = excel_path.stat()
+            excel_token = f"{excel_path.resolve()}|{stt.st_mtime_ns}|{stt.st_size}"
+        except Exception:
+            excel_token = str(excel_path)
+    if st.session_state.get("viewer_excel_token") != excel_token:
+        st.session_state["viewer_excel_token"] = excel_token
+        st.session_state.pop("viewer_pkg_updated_bytes", None)
+        st.session_state.pop("viewer_pkg_updated_ready", None)
     can_render = bool(
         st.session_state.get("viewer_has_valid_payload", False)
         and excel_path is not None
@@ -359,6 +380,7 @@ def main() -> None:
         and excel_path.is_file()
     )
     if can_render and excel_path is not None:
+        assets_dir = set_active_assets_for_file(excel_path)
         ok_full, issues = check_viewer_excel_completeness(excel_path)
         if not ok_full:
             st.warning("El paquete cargado no trae toda la estructura para mostrar todos los graficos:")
@@ -387,23 +409,27 @@ def main() -> None:
 
         if secure_package_available():
             try:
-                pkg_updated = build_secure_textana_package(
-                    excel_path.read_bytes(),
-                    source_name=excel_path.name,
-                    extra_files=collect_viewer_extra_files(),
-                )
+                if st.button("Preparar paquete .textana actualizado", use_container_width=True):
+                    pkg_updated = build_secure_textana_package(
+                        excel_path.read_bytes(),
+                        source_name=excel_path.name,
+                        extra_files=collect_viewer_extra_files(assets_dir),
+                    )
+                    st.session_state["viewer_pkg_updated_bytes"] = pkg_updated
+                    st.session_state["viewer_pkg_updated_ready"] = True
                 st.download_button(
                     "Descargar paquete .textana actualizado",
-                    data=pkg_updated,
+                    data=st.session_state.get("viewer_pkg_updated_bytes", b""),
                     file_name=f"{excel_path.stem}_actualizado.textana",
                     mime="application/octet-stream",
                     use_container_width=True,
+                    disabled=not bool(st.session_state.get("viewer_pkg_updated_ready", False)),
                 )
             except Exception as exc:
                 st.warning(f"No se pudo generar paquete actualizado: {exc}")
         st.divider()
         st.header("Graficos en la plataforma")
-        render_visual_dashboard(excel_path, selected_cross_vars_param=[], show_cross_section=False)
+        render_visual_dashboard(excel_path, selected_cross_vars_param=[], show_cross_section=False, assets_dir=assets_dir)
     else:
         st.info("Carga un archivo .textana valido para habilitar el visualizador.")
 
